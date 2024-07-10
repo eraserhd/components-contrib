@@ -33,13 +33,14 @@ import (
 
 // AWSSQS allows receiving and sending data to/from AWS SQS.
 type AWSSQS struct {
-	Client   *sqs.SQS
-	QueueURL *string
+	Client *sqs.SQS
 
-	logger  logger.Logger
-	wg      sync.WaitGroup
-	closeCh chan struct{}
-	closed  atomic.Bool
+	queueName string
+	queueURL  atomic.Pointer[string]
+	logger    logger.Logger
+	wg        sync.WaitGroup
+	closeCh   chan struct{}
+	closed    atomic.Bool
 }
 
 type sqsMetadata struct {
@@ -65,21 +66,12 @@ func (a *AWSSQS) Init(ctx context.Context, metadata bindings.Metadata) error {
 	if err != nil {
 		return err
 	}
+	a.queueName = m.QueueName
 
 	client, err := a.getClient(m)
 	if err != nil {
 		return err
 	}
-
-	queueName := m.QueueName
-	resultURL, err := client.GetQueueUrlWithContext(ctx, &sqs.GetQueueUrlInput{
-		QueueName: aws.String(queueName),
-	})
-	if err != nil {
-		return err
-	}
-
-	a.QueueURL = resultURL.QueueUrl
 	a.Client = client
 
 	return nil
@@ -91,17 +83,25 @@ func (a *AWSSQS) Operations() []bindings.OperationKind {
 
 func (a *AWSSQS) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
 	msgBody := string(req.Data)
-	_, err := a.Client.SendMessageWithContext(ctx, &sqs.SendMessageInput{
+	url, err := a.getQueueURL(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, err = a.Client.SendMessageWithContext(ctx, &sqs.SendMessageInput{
 		MessageBody: &msgBody,
-		QueueUrl:    a.QueueURL,
+		QueueUrl:    &url,
 	})
-
 	return nil, err
 }
 
 func (a *AWSSQS) Read(ctx context.Context, handler bindings.Handler) error {
 	if a.closed.Load() {
 		return errors.New("binding is closed")
+	}
+
+	url, err := a.getQueueURL(ctx)
+	if err != nil {
+		return err
 	}
 
 	a.wg.Add(1)
@@ -115,7 +115,7 @@ func (a *AWSSQS) Read(ctx context.Context, handler bindings.Handler) error {
 			}
 
 			result, err := a.Client.ReceiveMessageWithContext(ctx, &sqs.ReceiveMessageInput{
-				QueueUrl: a.QueueURL,
+				QueueUrl: &url,
 				AttributeNames: aws.StringSlice([]string{
 					"SentTimestamp",
 				}),
@@ -126,7 +126,7 @@ func (a *AWSSQS) Read(ctx context.Context, handler bindings.Handler) error {
 				WaitTimeSeconds: aws.Int64(20),
 			})
 			if err != nil {
-				a.logger.Errorf("Unable to receive message from queue %q, %v.", *a.QueueURL, err)
+				a.logger.Errorf("Unable to receive message from queue %q, %v.", url, err)
 			}
 
 			if len(result.Messages) > 0 {
@@ -141,7 +141,7 @@ func (a *AWSSQS) Read(ctx context.Context, handler bindings.Handler) error {
 
 						// Use a background context here because ctx may be canceled already
 						a.Client.DeleteMessageWithContext(context.Background(), &sqs.DeleteMessageInput{
-							QueueUrl:      a.QueueURL,
+							QueueUrl:      &url,
 							ReceiptHandle: msgHandle,
 						})
 					}
@@ -185,6 +185,20 @@ func (a *AWSSQS) getClient(metadata *sqsMetadata) (*sqs.SQS, error) {
 	c := sqs.New(sess)
 
 	return c, nil
+}
+
+func (a *AWSSQS) getQueueURL(ctx context.Context) (string, error) {
+	if url := a.queueURL.Load(); url != nil {
+		return *url, nil
+	}
+	resultURL, err := a.Client.GetQueueUrlWithContext(ctx, &sqs.GetQueueUrlInput{
+		QueueName: aws.String(a.queueName),
+	})
+	if err != nil {
+		return "", err
+	}
+	a.queueURL.CompareAndSwap(nil, resultURL.QueueUrl)
+	return *resultURL.QueueUrl, nil
 }
 
 // GetComponentMetadata returns the metadata of the component.
